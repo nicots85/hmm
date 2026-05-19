@@ -1,0 +1,41 @@
+# Core async / data
+aiohttp==3.9.3
+httpx==0.27.0
+python-dotenv==1.0.1
+pandas==2.2.2
+numpy==1.26.4
+pyarrow==15.0.2
+
+# Market data connectors
+ccxt==4.3.25
+yfinance==0.2.38
+
+# Feature engineering & statistics
+scipy==1.13.0
+scikit-learn==1.4.2
+pandas-ta==0.3.14b0
+
+# HMM core
+hmmlearn==0.3.2
+
+# Backtesting engine
+vectorbt==0.26.2
+
+# NLP / geopolitical sentiment
+transformers==4.40.2
+torch==2.2.2
+feedparser==6.0.11
+
+# Visualisation
+matplotlib==3.8.4
+seaborn==0.13.2
+plotly==5.22.0
+
+# Validation / config
+pydantic==2.7.1
+pydantic-settings==2.2.1
+
+# Testing
+pytest==8.2.0
+pytest-asyncio==0.23.6
+hypothesis==6.100.0
