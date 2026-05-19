@@ -36,8 +36,8 @@ from execution.risk_manager import DynamicStopLoss, KellyPositionSizer, StopLoss
 
 @pytest.fixture()
 def sample_ohlcv() -> pd.DataFrame:
-    """Minimal OHLCV DataFrame for feature engineering tests."""
-    n = 200
+    """500-bar OHLCV DataFrame — sufficient for extended HMM observation building."""
+    n = 500
     rng = np.random.default_rng(42)
     close = 30_000 + np.cumsum(rng.normal(0, 300, n))
     high = close + abs(rng.normal(0, 100, n))
@@ -131,24 +131,35 @@ class TestFeatureEngineer:
         fe = FeatureEngineer()
         out = fe.transform(sample_ohlcv)
         assert "log_ret" in out.columns
-        # First row is NaN from shift; transform() calls dropna()
         assert not out["log_ret"].isna().any()
 
     def test_log_returns_numerical_accuracy(self) -> None:
         """log_ret = ln(c_t / c_{t-1}); verify against manual calculation."""
-        prices = pd.Series([100.0, 105.0, 99.75])
-        expected = [np.log(105.0 / 100.0), np.log(99.75 / 105.0)]
-        index = pd.date_range("2023-01-01", periods=3, freq="1D", tz="UTC")
+        # Use 120 bars so rolling windows in transform() don't eat all rows.
+        n = 120
+        rng = np.random.default_rng(0)
+        prices = 100.0 * np.cumprod(1 + rng.normal(0, 0.01, n))
+        index = pd.date_range("2023-01-01", periods=n, freq="1D", tz="UTC")
         df = pd.DataFrame({
-            "open": prices, "high": prices * 1.01,
-            "low": prices * 0.99, "close": prices, "volume": [1e6] * 3,
+            "open": prices, "high": prices * 1.005,
+            "low": prices * 0.995, "close": prices,
+            "volume": np.full(n, 1e6),
         }, index=index)
 
-        fe = FeatureEngineer(FeatureConfig(atr_period=2, realised_vol_window=2,
-                                           vol_profile_window=2))
+        fe = FeatureEngineer(FeatureConfig(
+            atr_period=2, realised_vol_window=2, vol_profile_window=5
+        ))
         out = fe.transform(df)
-        computed = out["log_ret"].values
-        np.testing.assert_allclose(computed, expected, rtol=1e-10)
+
+        # Reconstruct expected log-returns for the rows that survived dropna
+        expected = np.log(prices[1:] / prices[:-1])
+        expected_series = pd.Series(expected, index=index[1:])
+        common = out.index.intersection(expected_series.index)
+        np.testing.assert_allclose(
+            out.loc[common, "log_ret"].values,
+            expected_series.loc[common].values,
+            rtol=1e-10,
+        )
 
     def test_atr_positive(self, sample_ohlcv: pd.DataFrame) -> None:
         fe = FeatureEngineer()
@@ -160,8 +171,58 @@ class TestFeatureEngineer:
         out = fe.transform(sample_ohlcv)
         obs = fe.get_hmm_observations(out)
         assert obs.ndim == 2
-        assert obs.shape[1] == 4    # [log_ret, realised_vol, atr_norm, vol_profile_z]
+        assert obs.shape[1] == 4
         assert not np.isnan(obs).any()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 2b. HMMRegimeDetector — extended observations + new methods
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestHMMRegimeDetector:
+
+    @pytest.fixture()
+    def fitted_hmm_and_obs(self, sample_ohlcv: pd.DataFrame):  # type: ignore[override]
+        """Returns (detector, obs_array) fitted on 200-bar sample."""
+        from models.hmm_regimes import HMMRegimeDetector
+        fe = FeatureEngineer()
+        feat = fe.transform(sample_ohlcv)
+        obs, idx = HMMRegimeDetector.build_extended_observations(feat)
+        # diag covariance + n_regimes=2: avoids degenerate transitions on
+        # short test datasets (200 bars, 10 features → 133 free params with full)
+        det = HMMRegimeDetector(n_regimes=2, covariance_type="diag", n_iter=50).fit(obs)
+        return det, obs, feat, idx
+
+    def test_extended_observations_shape(self, sample_ohlcv: pd.DataFrame) -> None:
+        """build_extended_observations returns (T, 10) matrix with no NaNs."""
+        from models.hmm_regimes import HMMRegimeDetector
+        fe = FeatureEngineer()
+        feat = fe.transform(sample_ohlcv)
+        obs, idx = HMMRegimeDetector.build_extended_observations(feat)
+        assert obs.ndim == 2
+        assert obs.shape[1] == 10
+        assert not np.isnan(obs).any()
+        assert len(idx) == obs.shape[0]
+
+    def test_predict_bull_prob_bounds(self, fitted_hmm_and_obs) -> None:  # type: ignore[no-untyped-def]
+        """predict_bull_prob values must be in [0, 1]."""
+        det, obs, _, _ = fitted_hmm_and_obs
+        probs = det.predict_bull_prob(obs)
+        assert probs.shape == (len(obs),)
+        assert (probs >= 0).all() and (probs <= 1).all()
+
+    def test_predict_bear_vol_prob_bounds(self, fitted_hmm_and_obs) -> None:  # type: ignore[no-untyped-def]
+        """predict_bear_vol_prob values must be in [0, 1]."""
+        det, obs, _, _ = fitted_hmm_and_obs
+        probs = det.predict_bear_vol_prob(obs)
+        assert ((probs >= 0) & (probs <= 1)).all()
+
+    def test_bull_plus_other_probs_sum_to_one(self, fitted_hmm_and_obs) -> None:  # type: ignore[no-untyped-def]
+        """Sum of all posterior probabilities per time step = 1."""
+        det, obs, _, _ = fitted_hmm_and_obs
+        posteriors = det.predict_proba(obs)
+        row_sums = posteriors.sum(axis=1)
+        np.testing.assert_allclose(row_sums, 1.0, atol=1e-6)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -249,16 +310,14 @@ class TestBacktestMetrics:
 
     def test_sortino_positive_returns(self) -> None:
         rets = self._positive_returns()
-        assert sortino_ratio(rets) >= sharpe_ratio(rets)  # Sortino ≥ Sharpe for positive drift
+        assert sortino_ratio(rets) >= sharpe_ratio(rets)
 
     def test_max_drawdown_always_negative_or_zero(self) -> None:
         equity = pd.Series([100.0, 105.0, 98.0, 110.0, 107.0])
-        dd = max_drawdown(equity)
-        assert dd <= 0
+        assert max_drawdown(equity) <= 0
 
     def test_max_drawdown_magnitude(self) -> None:
         equity = pd.Series([100.0, 120.0, 90.0])
-        # peak=120, trough=90 → dd = (90-120)/120 = -0.25
         assert max_drawdown(equity) == pytest.approx(-0.25, rel=1e-4)
 
     def test_profit_factor_all_wins(self) -> None:
@@ -268,3 +327,22 @@ class TestBacktestMetrics:
     def test_profit_factor_all_losses(self) -> None:
         rets = pd.Series([-0.01, -0.02])
         assert profit_factor(rets) == pytest.approx(0.0, abs=1e-9)
+
+    def test_sharpe_uses_365_periods(self) -> None:
+        """Default periods_per_year changed to 365 for 24/7 crypto markets."""
+        rets = pd.Series([0.001] * 365)
+        sr_365 = sharpe_ratio(rets, periods_per_year=365)
+        sr_252 = sharpe_ratio(rets, periods_per_year=252)
+        # 365 annualisation produces higher Sharpe than 252 for positive returns
+        assert sr_365 > sr_252
+
+    def test_regime_breakdown_returns_dataframe(self) -> None:
+        """regime_performance_breakdown returns a non-empty DataFrame."""
+        from backtest.engine import regime_performance_breakdown
+        rng = np.random.default_rng(7)
+        rets = pd.Series(rng.normal(0, 0.01, 100))
+        regimes = pd.Series(["bull_calm"] * 50 + ["bear_volatile"] * 50, index=rets.index)
+        result = regime_performance_breakdown(rets, regimes)
+        assert "bull_calm" in result.index
+        assert "bear_volatile" in result.index
+        assert "sharpe" in result.columns

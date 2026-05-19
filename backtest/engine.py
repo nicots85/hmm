@@ -41,16 +41,16 @@ logger = logging.getLogger(__name__)
 # Performance metrics (pure functions — no vectorbt dependency)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def sharpe_ratio(returns: pd.Series, risk_free: float = 0.0, periods_per_year: int = 252) -> float:
-    """Annualised Sharpe ratio from a series of period returns."""
+def sharpe_ratio(returns: pd.Series, risk_free: float = 0.0, periods_per_year: int = 365) -> float:
+    """Annualised Sharpe ratio. Default periods_per_year=365 for daily crypto (trades 24/7)."""
     excess = returns - risk_free / periods_per_year
     if excess.std() == 0:
         return 0.0
     return float((excess.mean() / excess.std()) * np.sqrt(periods_per_year))
 
 
-def sortino_ratio(returns: pd.Series, risk_free: float = 0.0, periods_per_year: int = 252) -> float:
-    """Annualised Sortino ratio (uses downside std only)."""
+def sortino_ratio(returns: pd.Series, risk_free: float = 0.0, periods_per_year: int = 365) -> float:
+    """Annualised Sortino ratio. Default periods_per_year=365 for daily crypto."""
     excess = returns - risk_free / periods_per_year
     downside = excess[excess < 0]
     if downside.empty or downside.std() == 0:
@@ -108,10 +108,36 @@ def geo_risk_exposure(
         "mean_pnl_normal": float(normal_trades.mean()) if not normal_trades.empty else 0.0,
     }
 
+def regime_performance_breakdown(
+    returns: pd.Series,
+    regime_series: pd.Series,
+) -> pd.DataFrame:
+    """
+    Break down strategy returns by HMM regime label.
 
-# ─────────────────────────────────────────────────────────────────────────────
-# BacktestResult dataclass
-# ─────────────────────────────────────────────────────────────────────────────
+    Args:
+        returns:       Per-period strategy returns (0 when flat).
+        regime_series: Series of string regime labels aligned to returns.
+
+    Returns:
+        DataFrame indexed by regime with [n_days, mean_ret, sharpe, win_rate].
+    """
+    common = returns.index.intersection(regime_series.index)
+    df = pd.DataFrame({"ret": returns.loc[common], "regime": regime_series.loc[common]})
+    rows = []
+    for lbl, grp in df.groupby("regime"):
+        r = grp["ret"]
+        rows.append({
+            "regime": lbl,
+            "n_days": len(r),
+            "mean_ret": float(r.mean()),
+            "sharpe": sharpe_ratio(r),
+            "win_rate": float((r > 0).mean()),
+        })
+    return pd.DataFrame(rows).set_index("regime").round(4)
+
+
+
 
 @dataclass
 class BacktestResult:
@@ -290,48 +316,56 @@ class BacktestEngine:
         )
 
     def _run_numpy(self, params: dict[str, Any]) -> BacktestResult:
-        """Pure-numpy bar-by-bar simulation (vectorbt fallback)."""
+        """
+        Pure-numpy vectorised simulation (vectorbt fallback).
+
+        Uses position-based P&L:
+          ret_t = pos_{t-1} * close_ret_t - |Δpos_t| * commission
+        This correctly handles both long and short positions and applies
+        transaction costs only at position changes (not every bar).
+        """
         close = self.close.values
-        signals = self.signals.values
-        equity = np.full(len(close), self.capital)
-        position = 0
-        entry_price = 0.0
+        sig   = self.signals.values.astype(float)
+        n     = len(close)
+
+        close_ret = np.zeros(n)
+        close_ret[1:] = np.diff(close) / (close[:-1] + 1e-12)
+
+        pos_lag   = np.roll(sig, 1); pos_lag[0] = 0.0
+        trade_cost = np.abs(np.diff(sig, prepend=sig[0])) * self.commission
+        period_ret = pos_lag * close_ret - trade_cost
+
+        equity = np.cumprod(1.0 + period_ret) * self.capital
+
+        eq_series  = pd.Series(equity, index=self.close.index)
+        ret_series = pd.Series(period_ret, index=self.close.index)
+
+        # Per-trade win rate
+        pos_series   = pd.Series(sig, index=self.close.index)
+        entries      = pos_series[pos_series != 0].index
         trade_returns: list[float] = []
-
-        for t in range(1, len(close)):
-            sig = signals[t]
-            if sig == 1 and position == 0:
-                position = 1
-                entry_price = close[t] * (1 + self.commission)
-            elif sig == -1 and position == 1:
-                exit_price = close[t] * (1 - self.commission)
-                trade_ret = (exit_price - entry_price) / entry_price
-                trade_returns.append(trade_ret)
-                position = 0
-
-            if position == 1:
-                equity[t] = equity[t - 1] * (close[t] / close[t - 1])
-            else:
-                equity[t] = equity[t - 1]
-
-        eq_series = pd.Series(equity, index=self.close.index)
-        eq_returns = eq_series.pct_change().dropna()
+        for i in range(len(entries) - 1):
+            sl = ret_series.loc[entries[i]: entries[i + 1]]
+            trade_returns.append(float(sl.sum()))
         trade_arr = np.array(trade_returns) if trade_returns else np.array([0.0])
+        win_rate  = float((trade_arr > 0).mean())
 
         trade_log = pd.DataFrame({"Return": trade_arr})
-        win_rate = float((trade_arr > 0).mean())
 
         geo = (
-            geo_risk_exposure(eq_returns, self.sentiment.reindex(eq_returns.index).fillna(0))
+            geo_risk_exposure(
+                ret_series,
+                self.sentiment.reindex(ret_series.index).fillna(0),
+            )
             if self.sentiment is not None
             else {}
         )
 
         return BacktestResult(
-            sharpe=sharpe_ratio(eq_returns),
-            sortino=sortino_ratio(eq_returns),
+            sharpe=sharpe_ratio(ret_series),
+            sortino=sortino_ratio(ret_series),
             max_drawdown_pct=abs(max_drawdown(eq_series)),
-            profit_factor=profit_factor(eq_returns),
+            profit_factor=profit_factor(ret_series),
             total_trades=len(trade_arr),
             win_rate=win_rate,
             geo_risk_metrics=geo,
