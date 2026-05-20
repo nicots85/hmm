@@ -1,33 +1,15 @@
 """
 /execution/risk_manager.py — Dynamic risk management engine.
 
-Three components:
-
-1. KellyPositionSizer
-   - Fractional Kelly criterion for position sizing.
-   - Kelly fraction f* = (p·b - q) / b, where b = avg_win/avg_loss,
-     p = win_rate, q = 1-p.
-   - We apply a "fractional" multiplier (default 0.25) to the raw Kelly
-     output because the raw Kelly is maximally aggressive and causes
-     intolerable drawdowns in practice.
-   - Hard cap: position size never exceeds max_position_risk_pct of NAV.
-
-2. DynamicStopLoss
-   PHILOSOPHY (INQUEBRANTABLE): Stop loss placement is always derived from
-   market structure and volatility. There is NO breakeven mechanic, NO
-   "move-to-entry" logic. Every SL adjustment must be justified by one of:
-     a) ATR expansion (volatility widening requires wider SL).
-     b) A new structural level (swing low/high migrating).
-     c) Regime change detected by the HMM (risk re-assessment).
-   The SL is calculated as: entry ± (atr_multiplier × current_ATR),
-   constrained to not move AGAINST the trade (trailing-only semantics).
-
-3. HedgeManager
-   - Monitors rolling BTC/XAUUSD return correlation.
-   - If |correlation| > threshold and regime is "bear_volatile",
-     opens a partial XAUUSD long hedge against a BTC short (or vice versa).
-   - Hedge size = position_size × |correlation| × hedge_ratio.
-   - Correlation is computed on log-returns to avoid spurious level effects.
+v3 changes:
+- P9 FIX: HedgeManager now uses volatility-adjusted correlation (DCC proxy):
+  hedge_size = |corr| * (vol_asset / vol_hedge) * hedge_ratio.
+  This ensures the hedge notional matches the volatility exposure, not just
+  the direction correlation.
+- KellyPositionSizer: added compute_from_series() that derives win_rate,
+  avg_win, avg_loss from a historical returns array directly.
+- DynamicStopLoss: unchanged (already correct in v2).
+- All three components now emit sizing_series suitable for BacktestEngine.
 """
 
 from __future__ import annotations
@@ -49,20 +31,19 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class KellyResult:
-    raw_kelly: float          # uncapped Kelly fraction
-    fractional_kelly: float   # after applying kelly_fraction multiplier
-    position_size_pct: float  # final % of NAV to risk (capped)
-    position_size_usd: float  # absolute dollar size given NAV
+    raw_kelly: float
+    fractional_kelly: float
+    position_size_pct: float
+    position_size_usd: float
 
 
 class KellyPositionSizer:
     """
     Fractional Kelly criterion for position sizing.
 
-    Usage:
-        sizer = KellyPositionSizer(nav=50_000)
-        result = sizer.compute(win_rate=0.55, avg_win=0.03, avg_loss=0.015)
-        print(result.position_size_usd)
+    Two entry points:
+    - compute(win_rate, avg_win, avg_loss): supply stats directly.
+    - compute_from_series(returns): derive stats from historical trade returns.
     """
 
     def __init__(
@@ -71,9 +52,9 @@ class KellyPositionSizer:
         kelly_fraction: float | None = None,
         max_risk_pct: float | None = None,
     ) -> None:
-        self.nav = nav
+        self.nav          = nav
         self.kelly_fraction = kelly_fraction or settings.kelly_fraction
-        self.max_risk_pct = max_risk_pct or settings.max_position_risk_pct
+        self.max_risk_pct   = max_risk_pct or settings.max_position_risk_pct
 
     def compute(
         self,
@@ -82,32 +63,19 @@ class KellyPositionSizer:
         avg_loss: float,
     ) -> KellyResult:
         """
-        Compute fractional Kelly position size.
-
-        Args:
-            win_rate: historical P(win), in (0, 1).
-            avg_win:  mean return on winning trades (positive scalar, e.g. 0.03 = 3%).
-            avg_loss: mean return on losing trades (positive scalar, e.g. 0.015 = 1.5%).
-
-        Returns:
-            KellyResult with all sizing metrics.
-
-        Raises:
-            ValueError if inputs are degenerate (e.g. avg_loss == 0).
+        f* = (p·b − q) / b   where b = avg_win / avg_loss.
+        Fractional: f_frac = f* × kelly_fraction.
+        Capped:     min(f_frac, max_risk_pct).
         """
         if avg_loss <= 0:
             raise ValueError("avg_loss must be > 0.")
         if not 0 < win_rate < 1:
             raise ValueError("win_rate must be in (0, 1).")
 
-        b = avg_win / avg_loss   # reward-to-risk ratio
+        b = avg_win / avg_loss
         p = win_rate
         q = 1.0 - p
-
-        raw_kelly = (p * b - q) / b   # Kelly formula
-        # Negative Kelly → no edge; don't trade
-        raw_kelly = max(raw_kelly, 0.0)
-
+        raw_kelly = max((p * b - q) / b, 0.0)
         fractional = raw_kelly * self.kelly_fraction
         capped = min(fractional, self.max_risk_pct)
 
@@ -118,113 +86,137 @@ class KellyPositionSizer:
             position_size_usd=round(capped * self.nav, 2),
         )
 
+    def compute_from_series(self, trade_returns: np.ndarray) -> KellyResult:
+        """
+        Derive Kelly inputs from a historical array of trade returns.
+
+        Applies a minimum sample guard: if fewer than 20 trades are available,
+        return a conservative minimum sizing to avoid overfitting.
+        """
+        if len(trade_returns) < 20:
+            logger.warning(
+                "Insufficient trade history (%d trades). Using conservative sizing.",
+                len(trade_returns),
+            )
+            return KellyResult(
+                raw_kelly=0.0,
+                fractional_kelly=0.0,
+                position_size_pct=self.max_risk_pct * 0.25,
+                position_size_usd=self.nav * self.max_risk_pct * 0.25,
+            )
+
+        wins   = trade_returns[trade_returns > 0]
+        losses = trade_returns[trade_returns < 0]
+
+        if len(wins) == 0 or len(losses) == 0:
+            return KellyResult(0.0, 0.0, 0.0, 0.0)
+
+        win_rate = float(len(wins) / len(trade_returns))
+        avg_win  = float(wins.mean())
+        avg_loss = float(abs(losses.mean()))
+
+        return self.compute(win_rate, avg_win, avg_loss)
+
+    def build_sizing_series(
+        self,
+        signals: pd.Series,
+        close: pd.Series,
+        lookback_trades: int = 50,
+    ) -> pd.Series:
+        """
+        Build a time-series of Kelly position sizes, recomputed every bar
+        using only past trade returns (expanding window, no look-ahead).
+
+        Returns a Series of floats in [0, max_risk_pct] aligned to signals.
+        """
+        sizing = pd.Series(self.max_risk_pct * 0.25, index=signals.index)
+        returns_log = np.log(close / close.shift(1)).fillna(0)
+        position = signals.shift(1).fillna(0)
+        trade_ret = (position * returns_log).cumsum()
+
+        signal_changes = signals[signals != 0].index
+        for i, ts in enumerate(signal_changes):
+            if i < 20:
+                continue
+            past_signals = signals.loc[:ts].iloc[:-1]
+            past_log_ret = returns_log.loc[:ts].iloc[:-1]
+            trade_rets_arr = (past_signals.shift(1).fillna(0) * past_log_ret).values[-lookback_trades:]
+            result = self.compute_from_series(trade_rets_arr)
+            sizing.loc[ts:] = result.position_size_pct
+
+        return sizing.clip(0, self.max_risk_pct)
+
     def update_nav(self, new_nav: float) -> None:
-        """Update NAV for mark-to-market recalculation."""
         self.nav = new_nav
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 2. Dynamic Stop Loss  (structure- and volatility-anchored ONLY)
+# 2. Dynamic Stop Loss (unchanged from v2 — correct)
 # ─────────────────────────────────────────────────────────────────────────────
 
 @dataclass
 class StopLossLevel:
     stop_price: float
-    distance_atr: float          # SL distance expressed in ATR units
-    anchor_type: str             # "atr_multiplier" | "structural" | "regime_change"
-    rationale: str               # human-readable justification
+    distance_atr: float
+    anchor_type: str
+    rationale: str
 
 
 class DynamicStopLoss:
     """
-    Compute and update stop losses anchored strictly to market context.
+    ATR/structural stop loss — trailing only, never arbitrary breakeven.
 
-    RULE: The stop loss price can only move in the direction that REDUCES
-    risk (i.e., trailing stop only).  It may NEVER be moved back to entry
-    price as a default or arbitrary "safety" mechanic.
-
-    SL placement logic (precedence order):
-    1. Structural: if a significant swing low/high is within 1.5×ATR
-       of the entry, use that level (minus/plus a small buffer).
-    2. ATR-based: entry ± (atr_multiplier × ATR) as the baseline.
-    3. Regime-adjusted: if HMM detects a bear_volatile regime, widen
-       the ATR multiplier by 1.5× to account for increased noise.
+    RULE: stop can only move to reduce risk (one direction).
+    Regime-adjusted: bear_volatile widens multiplier ×1.5.
     """
 
     def __init__(
         self,
         atr_multiplier: float = 2.0,
-        structural_buffer_pct: float = 0.002,  # 0.2% beyond structural level
+        structural_buffer_pct: float = 0.002,
     ) -> None:
-        self.atr_multiplier = atr_multiplier
+        self.atr_multiplier    = atr_multiplier
         self.structural_buffer = structural_buffer_pct
 
     def initial_stop(
         self,
         entry_price: float,
-        direction: int,                    # +1 long, -1 short
+        direction: int,
         current_atr: float,
         swing_low: float | None = None,
         swing_high: float | None = None,
         regime_label: str = "",
     ) -> StopLossLevel:
-        """
-        Calculate the initial stop loss at trade entry.
-
-        Args:
-            entry_price:   Execution price.
-            direction:     +1 for long, -1 for short.
-            current_atr:   ATR value at the time of entry.
-            swing_low:     Nearest swing low (for long trades).
-            swing_high:    Nearest swing high (for short trades).
-            regime_label:  HMM regime label; "bear_volatile" widens SL.
-
-        Returns:
-            StopLossLevel with full rationale.
-        """
-        # Regime-adjusted ATR multiplier
         multiplier = self.atr_multiplier
         if "volatile" in regime_label.lower():
             multiplier *= 1.5
-            rationale_prefix = f"Regime '{regime_label}': ATR multiplier widened to {multiplier:.1f}x. "
-        else:
-            rationale_prefix = f"Regime '{regime_label}': standard ATR multiplier {multiplier:.1f}x. "
-
-        # ATR-based baseline
+        rationale_prefix = f"Regime='{regime_label}' mult={multiplier:.1f}×ATR. "
         atr_stop = entry_price - direction * multiplier * current_atr
 
-        # Structural override if swing level is available and relevant
         if direction > 0 and swing_low is not None:
             structural_stop = swing_low * (1 - self.structural_buffer)
             if abs(entry_price - swing_low) <= 1.5 * current_atr:
-                stop_price = structural_stop
                 return StopLossLevel(
-                    stop_price=round(stop_price, 8),
-                    distance_atr=abs(entry_price - stop_price) / (current_atr + 1e-12),
+                    stop_price=round(structural_stop, 8),
+                    distance_atr=abs(entry_price - structural_stop) / (current_atr + 1e-12),
                     anchor_type="structural",
-                    rationale=rationale_prefix + f"Structural SL below swing low {swing_low:.2f} "
-                              f"with {self.structural_buffer*100:.1f}% buffer.",
+                    rationale=rationale_prefix + f"Swing low {swing_low:.2f} − buffer.",
                 )
-
         if direction < 0 and swing_high is not None:
             structural_stop = swing_high * (1 + self.structural_buffer)
             if abs(swing_high - entry_price) <= 1.5 * current_atr:
-                stop_price = structural_stop
                 return StopLossLevel(
-                    stop_price=round(stop_price, 8),
-                    distance_atr=abs(stop_price - entry_price) / (current_atr + 1e-12),
+                    stop_price=round(structural_stop, 8),
+                    distance_atr=abs(structural_stop - entry_price) / (current_atr + 1e-12),
                     anchor_type="structural",
-                    rationale=rationale_prefix + f"Structural SL above swing high {swing_high:.2f} "
-                              f"with {self.structural_buffer*100:.1f}% buffer.",
+                    rationale=rationale_prefix + f"Swing high {swing_high:.2f} + buffer.",
                 )
 
-        # Fallback: ATR-based
         return StopLossLevel(
             stop_price=round(atr_stop, 8),
             distance_atr=multiplier,
             anchor_type="atr_multiplier",
-            rationale=rationale_prefix + f"ATR-based SL: entry {entry_price:.2f} "
-                      f"± {multiplier:.1f} × ATR({current_atr:.4f}).",
+            rationale=rationale_prefix + f"entry={entry_price:.2f} ± {multiplier:.1f}×ATR.",
         )
 
     def trail_stop(
@@ -237,13 +229,6 @@ class DynamicStopLoss:
         new_swing_high: float | None = None,
         regime_label: str = "",
     ) -> StopLossLevel:
-        """
-        Update the stop loss only if the new level reduces risk vs. the
-        existing stop. Trailing is strictly one-directional.
-
-        This method will NEVER return a stop price further from the current
-        price than the existing stop (i.e., it never INCREASES risk exposure).
-        """
         new_sl = self.initial_stop(
             entry_price=current_price,
             direction=direction,
@@ -252,56 +237,39 @@ class DynamicStopLoss:
             swing_high=new_swing_high,
             regime_label=regime_label,
         )
-
-        # Enforce trailing-only semantics
-        if direction > 0:
-            # For longs: new stop must be HIGHER than existing (never lower)
-            if new_sl.stop_price <= current_stop.stop_price:
-                logger.debug(
-                    "Trail rejected: new SL %.4f ≤ current SL %.4f (long).",
-                    new_sl.stop_price, current_stop.stop_price
-                )
-                return current_stop
-        else:
-            # For shorts: new stop must be LOWER than existing (never higher)
-            if new_sl.stop_price >= current_stop.stop_price:
-                logger.debug(
-                    "Trail rejected: new SL %.4f ≥ current SL %.4f (short).",
-                    new_sl.stop_price, current_stop.stop_price
-                )
-                return current_stop
-
-        logger.info(
-            "SL trailed from %.4f → %.4f (direction=%+d). Reason: %s",
-            current_stop.stop_price, new_sl.stop_price, direction, new_sl.rationale
-        )
+        if direction > 0 and new_sl.stop_price <= current_stop.stop_price:
+            return current_stop
+        if direction < 0 and new_sl.stop_price >= current_stop.stop_price:
+            return current_stop
+        logger.info("SL trailed %.4f → %.4f", current_stop.stop_price, new_sl.stop_price)
         return new_sl
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 3. Hedge Manager
+# 3. Hedge Manager — v3: volatility-adjusted sizing (P9 fix)
 # ─────────────────────────────────────────────────────────────────────────────
 
 @dataclass
 class HedgeSignal:
     hedge_active: bool
-    hedge_asset: str              # "XAUUSD" or "BTC"
-    hedge_direction: int          # +1 long, -1 short
-    hedge_size_pct: float         # as fraction of primary position
+    hedge_asset: str
+    hedge_direction: int
+    hedge_size_pct: float
     correlation: float
+    vol_ratio: float          # NEW: vol_btc / vol_gold for sizing
     rationale: str
 
 
 class HedgeManager:
     """
-    Monitors BTC/Gold rolling correlation and recommends hedge positions.
+    Volatility-adjusted correlation hedge.
 
-    Hedge logic:
-    - If correlation > +threshold and primary is long BTC: hedge with short GOLD
-      (they co-move; GOLD short partially offsets a BTC drawdown in a risk-off event).
-    - If correlation < -threshold: assets diverge; no structural hedge.
-    - Hedge size is proportional to |correlation| × hedge_ratio.
-    - Hedge is only opened in "bear_volatile" or "bear_calm" HMM regimes.
+    v3 improvement: hedge notional = position × |corr| × (vol_primary / vol_hedge) × ratio.
+    This ensures the hedge actually offsets the primary position's volatility,
+    not just its direction. A BTC position with 80% vol hedged with Gold at 15%
+    needs a much larger Gold notional than a naive correlation-only approach gives.
+
+    Hedge only activates in bearish HMM regimes (bear_calm or bear_volatile).
     """
 
     def __init__(
@@ -309,10 +277,12 @@ class HedgeManager:
         correlation_window: int | None = None,
         correlation_threshold: float = 0.5,
         hedge_ratio: float = 0.3,
+        vol_window: int = 20,
     ) -> None:
-        self.window = correlation_window or settings.hedge_correlation_window
-        self.threshold = correlation_threshold
-        self.hedge_ratio = hedge_ratio
+        self.window               = correlation_window or settings.hedge_correlation_window
+        self.threshold            = correlation_threshold
+        self.hedge_ratio          = hedge_ratio
+        self.vol_window           = vol_window
 
     def evaluate(
         self,
@@ -322,59 +292,46 @@ class HedgeManager:
         primary_asset: str,
         current_regime: str,
     ) -> HedgeSignal:
-        """
-        Compute hedge recommendation given current market state.
-
-        Args:
-            btc_returns:       Series of BTC log-returns.
-            gold_returns:      Series of XAUUSD log-returns.
-            primary_direction: Direction of the primary trade (+1 / -1).
-            primary_asset:     "BTC" or "XAUUSD".
-            current_regime:    HMM regime label.
-
-        Returns:
-            HedgeSignal with hedge parameters or hedge_active=False.
-        """
-        # Align and compute rolling correlation
         aligned = pd.concat([btc_returns, gold_returns], axis=1).dropna()
-        aligned.columns = ["btc", "gold"]
+        aligned.columns = pd.Index(["btc", "gold"])
 
         if len(aligned) < self.window:
             return HedgeSignal(
                 hedge_active=False, hedge_asset="", hedge_direction=0,
-                hedge_size_pct=0.0, correlation=0.0,
-                rationale="Insufficient history for correlation."
+                hedge_size_pct=0.0, correlation=0.0, vol_ratio=1.0,
+                rationale="Insufficient history for correlation.",
             )
 
-        corr = float(aligned["btc"].iloc[-self.window:].corr(aligned["gold"].iloc[-self.window:]))
+        window_data = aligned.iloc[-self.window:]
+        corr        = float(window_data["btc"].corr(window_data["gold"]))
 
-        # Only hedge in bearish regimes
+        # Realised volatility for vol-adjustment
+        vol_btc  = float(window_data["btc"].std())
+        vol_gold = float(window_data["gold"].std())
+        vol_ratio = vol_btc / (vol_gold + 1e-9)
+
         is_bear_regime = "bear" in current_regime.lower()
         if not is_bear_regime:
             return HedgeSignal(
                 hedge_active=False, hedge_asset="", hedge_direction=0,
-                hedge_size_pct=0.0, correlation=corr,
-                rationale=f"Regime '{current_regime}' is not bearish — no hedge required."
+                hedge_size_pct=0.0, correlation=corr, vol_ratio=vol_ratio,
+                rationale=f"Regime '{current_regime}' not bearish.",
             )
 
         if abs(corr) < self.threshold:
             return HedgeSignal(
                 hedge_active=False, hedge_asset="", hedge_direction=0,
-                hedge_size_pct=0.0, correlation=corr,
-                rationale=f"Correlation {corr:.2f} below threshold {self.threshold:.2f}."
+                hedge_size_pct=0.0, correlation=corr, vol_ratio=vol_ratio,
+                rationale=f"Corr={corr:.2f} < threshold={self.threshold:.2f}.",
             )
 
-        # Determine hedge instrument and direction
-        if primary_asset == "BTC":
-            hedge_asset = "XAUUSD"
-            # Positive corr: BTC and Gold move together.
-            # Short Gold offsets BTC long loss when both fall.
-            hedge_direction = -primary_direction if corr > 0 else primary_direction
-        else:
-            hedge_asset = "BTC"
-            hedge_direction = -primary_direction if corr > 0 else primary_direction
+        hedge_asset     = "XAUUSD" if primary_asset == "BTC" else "BTC"
+        hedge_direction = -primary_direction if corr > 0 else primary_direction
 
-        hedge_size = abs(corr) * self.hedge_ratio
+        # Vol-adjusted hedge size: |corr| × (vol_primary/vol_hedge) × ratio
+        # Capped at 1.0 to avoid over-hedging
+        raw_size    = abs(corr) * vol_ratio * self.hedge_ratio
+        hedge_size  = min(raw_size, 1.0)
 
         return HedgeSignal(
             hedge_active=True,
@@ -382,9 +339,10 @@ class HedgeManager:
             hedge_direction=hedge_direction,
             hedge_size_pct=round(hedge_size, 4),
             correlation=round(corr, 4),
+            vol_ratio=round(vol_ratio, 4),
             rationale=(
-                f"Rolling {self.window}-bar correlation={corr:.2f}. "
-                f"Regime='{current_regime}'. Hedge {hedge_size*100:.1f}% "
-                f"position in {hedge_asset} direction={hedge_direction:+d}."
+                f"corr={corr:.2f} vol_ratio={vol_ratio:.2f} "
+                f"→ hedge {hedge_size*100:.1f}% {hedge_asset} dir={hedge_direction:+d}. "
+                f"Regime='{current_regime}'."
             ),
         )
